@@ -1,0 +1,8 @@
+build/
+.vscode/
+.devcontainer/
+.clangd
+*.log
+*.hex
+*.bin
+*.elf
