@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "driver/pulse_cnt.h"
 #include "driver/gpio.h"
@@ -24,11 +25,11 @@ static int pulse_count = 0;
 static int encoder_revolution = 0;
 static float distance_x = 0.0f;
 
-#define EXAMPLE_PCNT_HIGH_LIMIT 30000
-#define EXAMPLE_PCNT_LOW_LIMIT  -30000  
+#define EXAMPLE_PCNT_HIGH_LIMIT 600
+#define EXAMPLE_PCNT_LOW_LIMIT  -600 
 #define ENCODER_PPR  600  // pulses per revolution
 #define GEAR_RATIO   1    // gear ratio
-#define WHEEL_DIA_MM  60   // wheel diameter in mm
+#define WHEEL_DIA_MM  200   // wheel diameter in mm
 #define WHEEL_CIRCUM_MM  (WHEEL_DIA_MM * 3.1416)
 
 #define EXAMPLE_EC11_GPIO_A 16
@@ -40,6 +41,7 @@ TaskHandle_t uart2_task_handle = NULL;
 QueueHandle_t uart1_queue = NULL;
 QueueHandle_t uart2_queue = NULL;
 QueueHandle_t pcnt_val_queue = NULL;
+SemaphoreHandle_t pcnt_semaphore = NULL;
 
 static esp_err_t uart_init(void)
 {
@@ -67,10 +69,11 @@ static esp_err_t uart_init(void)
     return ESP_OK;
 }
 
-float calculate_current_x_cm(float begin_pos, int pulse_count)
+float calculate_current_x_m(float begin_pos, int pulse_count)
 {
-    encoder_revolution = pulse_count / (ENCODER_PPR * GEAR_RATIO);
-    distance_x = (encoder_revolution * WHEEL_CIRCUM_MM) / 10.0f; // convert to cm
+    float distance_x = 0.0f;
+    // total revolutions = full revolutions + partial revolution
+    distance_x = (encoder_revolution + (float)pulse_count / ENCODER_PPR) * WHEEL_CIRCUM_MM / 1000.0f; // convert to cm
     return begin_pos + distance_x;
 }
 
@@ -85,11 +88,12 @@ static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_even
 
 void app_main(void)
 {
-    pcnt_val_queue = xQueueCreate(1, sizeof(int));
+    pcnt_val_queue = xQueueCreate(1, sizeof(float));
     uart1_queue = xQueueCreate(1, sizeof(float));
     uart2_queue = xQueueCreate(1, sizeof(float));
-    if (!pcnt_val_queue || !uart1_queue || !uart2_queue) {
-        ESP_LOGE(TAG, "Failed to create queues");
+    pcnt_semaphore = xSemaphoreCreateMutex();
+    if (!pcnt_val_queue || !uart1_queue || !uart2_queue || !pcnt_semaphore) {
+        ESP_LOGE(TAG, "Failed to create queues or semaphore");
         return;
     }
     ESP_LOGI(TAG, "install pcnt unit");
@@ -127,7 +131,7 @@ void app_main(void)
     ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chan_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
 
     ESP_LOGI(TAG, "add watch points and register callbacks");
-    int watch_points[] = {EXAMPLE_PCNT_LOW_LIMIT, -50, 0, 50, EXAMPLE_PCNT_HIGH_LIMIT};
+    int watch_points[] = {EXAMPLE_PCNT_LOW_LIMIT, 0, EXAMPLE_PCNT_HIGH_LIMIT};
     for (size_t i = 0; i < sizeof(watch_points) / sizeof(watch_points[0]); i++) {
         ESP_ERROR_CHECK(pcnt_unit_add_watch_point(pcnt_unit, watch_points[i]));
     }
@@ -157,10 +161,23 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_light_sleep_start());
 #endif
     // Report counter value
-    
+    int event_count = 0;
+    float begin_pos_x = 0.0f;
     while (1) {
+        if (xQueueReceive(queue, &event_count, pdMS_TO_TICKS(20)))
+        {
+            //ESP_LOGI(TAG, "PCNT event: count=%d", event_count);
+            if (event_count == EXAMPLE_PCNT_HIGH_LIMIT) {
+                encoder_revolution += 1;
+                //ESP_LOGI(TAG, "Reached high limit");
+            } else if (event_count == EXAMPLE_PCNT_LOW_LIMIT) {
+                encoder_revolution -= 1;
+                //ESP_LOGI(TAG, "Reached low limit");
+            }
+        }
         ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
-        xQueueSend(pcnt_val_queue, &pulse_count, portMAX_DELAY);
+        begin_pos_x = calculate_current_x_m(0, pulse_count);
+        xQueueSend(pcnt_val_queue, &begin_pos_x, portMAX_DELAY);
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
@@ -237,13 +254,12 @@ static void uart2_task_handler(void *arg)
 
 static void log_handler(void *arg)
 {
-    pcnt_unit_handle_t pcnt_unit = (pcnt_unit_handle_t)arg;
-    int pcnt_value = 0;
+    float pcnt_value = 0;
     float distance_mm_z[2] = {0.0f, 0.0f};
     while (1) {
         xQueueReceive(pcnt_val_queue, &pcnt_value, portMAX_DELAY);
         xQueueReceive(uart1_queue, &distance_mm_z[0], portMAX_DELAY);
         xQueueReceive(uart2_queue, &distance_mm_z[1], portMAX_DELAY);
-        ESP_LOGI(TAG, "PS: %d, Dist[1]: %.2f , Dist[2]: %.2f ", pcnt_value, distance_mm_z[0], distance_mm_z[1]);
+        ESP_LOGI(TAG, "PS: %.2f, Dist[1]: %.2f , Dist[2]: %.2f ", pcnt_value, distance_mm_z[0], distance_mm_z[1]);
     }
 }
