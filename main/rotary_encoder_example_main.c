@@ -21,9 +21,15 @@ static void log_handler(void *arg);
 static const char *TAG = "example";
 
 static int pulse_count = 0;
+static int encoder_revolution = 0;
+static float distance_x = 0.0f;
 
 #define EXAMPLE_PCNT_HIGH_LIMIT 30000
 #define EXAMPLE_PCNT_LOW_LIMIT  -30000  
+#define ENCODER_PPR  600  // pulses per revolution
+#define GEAR_RATIO   1    // gear ratio
+#define WHEEL_DIA_MM  60   // wheel diameter in mm
+#define WHEEL_CIRCUM_MM  (WHEEL_DIA_MM * 3.1416)
 
 #define EXAMPLE_EC11_GPIO_A 16
 #define EXAMPLE_EC11_GPIO_B 17
@@ -59,6 +65,13 @@ static esp_err_t uart_init(void)
     // test print
     // uart_write_bytes(UART_NUM_0, "UART initialized\n", 17);
     return ESP_OK;
+}
+
+float calculate_current_x_cm(float begin_pos, int pulse_count)
+{
+    encoder_revolution = pulse_count / (ENCODER_PPR * GEAR_RATIO);
+    distance_x = (encoder_revolution * WHEEL_CIRCUM_MM) / 10.0f; // convert to cm
+    return begin_pos + distance_x;
 }
 
 static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
@@ -161,7 +174,7 @@ static void uart1_task_handler(void *arg)
     */
     const uart_port_t uart_num = (uart_port_t)arg;
     const static uint8_t sick_sensor_ask[] = {0x02, 0x43, 0xB0, 0x01, 0x03, 0xF2};
-    float distance_mm = 0.0f;
+    float distance_mm_z = 0.0f;
     uint8_t* data = (uint8_t*) malloc(10);
     
     while (1) {
@@ -173,8 +186,8 @@ static void uart1_task_handler(void *arg)
             if (len >= 6 && data[0] == 0x02 && data[1] == 0x06) {
                 // valid data frame
                 int16_t raw_value = (data[2] << 8) | data[3];
-                distance_mm = raw_value / 100.0f; // convert to mm
-                xQueueSend(uart1_queue, &distance_mm, portMAX_DELAY);
+                distance_mm_z = raw_value / 100.0f; // convert to mm
+                xQueueSend(uart1_queue, &distance_mm_z, portMAX_DELAY);
                 uart_flush(uart_num);
             }
         }
@@ -196,7 +209,7 @@ static void uart2_task_handler(void *arg)
     */
     const uart_port_t uart_num = (uart_port_t)arg;
     const static uint8_t sick_sensor_ask[] = {0x02, 0x43, 0xB0, 0x01, 0x03, 0xF2};
-    float distance_mm = 0.0f;
+    float distance_mm_z = 0.0f;
     uint8_t* data = (uint8_t*) malloc(10);
     
     while (1) {
@@ -208,8 +221,8 @@ static void uart2_task_handler(void *arg)
             if (len >= 6 && data[0] == 0x02 && data[1] == 0x06) {
                 // valid data frame
                 int16_t raw_value = (data[2] << 8) | data[3];
-                distance_mm = raw_value / 100.0f; // convert to mm
-                xQueueSend(uart2_queue, &distance_mm, portMAX_DELAY);
+                distance_mm_z = raw_value / 100.0f; // convert to mm
+                xQueueSend(uart2_queue, &distance_mm_z, portMAX_DELAY);
                 uart_flush(uart_num);
             }
         }
@@ -226,11 +239,11 @@ static void log_handler(void *arg)
 {
     pcnt_unit_handle_t pcnt_unit = (pcnt_unit_handle_t)arg;
     int pcnt_value = 0;
-    float dist1 = 0.0f, dist2 = 0.0f;
+    float distance_mm_z[2] = {0.0f, 0.0f};
     while (1) {
         xQueueReceive(pcnt_val_queue, &pcnt_value, portMAX_DELAY);
-        xQueueReceive(uart1_queue, &dist1, portMAX_DELAY);
-        xQueueReceive(uart2_queue, &dist2, portMAX_DELAY);
-        ESP_LOGI(TAG, "Pulse Count: %d, Distance Sensor1: %.2f mm, Distance Sensor2: %.2f mm", pcnt_value, dist1, dist2);
+        xQueueReceive(uart1_queue, &distance_mm_z[0], portMAX_DELAY);
+        xQueueReceive(uart2_queue, &distance_mm_z[1], portMAX_DELAY);
+        ESP_LOGI(TAG, "PS: %d, Dist[1]: %.2f , Dist[2]: %.2f ", pcnt_value, distance_mm_z[0], distance_mm_z[1]);
     }
 }
