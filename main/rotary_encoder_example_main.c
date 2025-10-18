@@ -12,14 +12,54 @@
 #include "driver/pulse_cnt.h"
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "driver/uart.h"
+
+static void uart1_task_handler(void *arg);
+static void uart2_task_handler(void *arg);
+static void log_handler(void *arg);
 
 static const char *TAG = "example";
+
+static int pulse_count = 0;
 
 #define EXAMPLE_PCNT_HIGH_LIMIT 30000
 #define EXAMPLE_PCNT_LOW_LIMIT  -30000  
 
 #define EXAMPLE_EC11_GPIO_A 16
 #define EXAMPLE_EC11_GPIO_B 17
+
+TaskHandle_t log_handle = NULL;
+TaskHandle_t uart1_task_handle = NULL;
+TaskHandle_t uart2_task_handle = NULL;
+QueueHandle_t uart1_queue = NULL;
+QueueHandle_t uart2_queue = NULL;
+QueueHandle_t pcnt_val_queue = NULL;
+
+static esp_err_t uart_init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, GPIO_NUM_26, 13, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0));
+    
+    xTaskCreatePinnedToCore(uart1_task_handler, "uart1_task", 2048, (void*)UART_NUM_1, 10, &uart1_task_handle, 1);
+
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, 19, 18, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_2, 256, 0, 0, NULL, 0));
+    
+    xTaskCreatePinnedToCore(uart2_task_handler, "uart2_task", 2048, (void*)UART_NUM_2, 10, &uart2_task_handle, 1);
+    
+    // test print
+    // uart_write_bytes(UART_NUM_0, "UART initialized\n", 17);
+    return ESP_OK;
+}
 
 static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
 {
@@ -32,6 +72,13 @@ static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_even
 
 void app_main(void)
 {
+    pcnt_val_queue = xQueueCreate(1, sizeof(int));
+    uart1_queue = xQueueCreate(1, sizeof(float));
+    uart2_queue = xQueueCreate(1, sizeof(float));
+    if (!pcnt_val_queue || !uart1_queue || !uart2_queue) {
+        ESP_LOGE(TAG, "Failed to create queues");
+        return;
+    }
     ESP_LOGI(TAG, "install pcnt unit");
     pcnt_unit_config_t unit_config = {
         .high_limit = EXAMPLE_PCNT_HIGH_LIMIT,
@@ -83,6 +130,12 @@ void app_main(void)
     ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
     ESP_LOGI(TAG, "start pcnt unit");
     ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
+    
+    xTaskCreatePinnedToCore(log_handler, "log_task", 4096, (void*)pcnt_unit, 10, &log_handle, 1);
+
+    ESP_LOGI(TAG, "initialize uart");
+    ESP_ERROR_CHECK(uart_init());
+
 
 #if CONFIG_EXAMPLE_WAKE_UP_LIGHT_SLEEP
     // EC11 channel output high level in normal state, so we set "low level" to wake up the chip
@@ -90,16 +143,94 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
     ESP_ERROR_CHECK(esp_light_sleep_start());
 #endif
-
     // Report counter value
-    int pulse_count = 0;
-    int event_count = 0;
+    
     while (1) {
-        if (xQueueReceive(queue, &event_count, pdMS_TO_TICKS(20))) {
-            ESP_LOGI("", "%d", event_count);
-        } else {
-            ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
-            ESP_LOGI("", "%d", pulse_count);
+        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
+        xQueueSend(pcnt_val_queue, &pulse_count, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static void uart1_task_handler(void *arg)
+{
+    /*
+    Transmission command: STX (02h) C (43h) B0h 01h ETX (03h) BCC (F2h)
+    Incoming data: STX (02h) ACK (06h) FCh 6Fh ETX (03h) BCC (95h)
+    *example with OD1-B035x15xxx/ measuring value = –9.13 mm
+    */
+    const uart_port_t uart_num = (uart_port_t)arg;
+    const static uint8_t sick_sensor_ask[] = {0x02, 0x43, 0xB0, 0x01, 0x03, 0xF2};
+    float distance_mm = 0.0f;
+    uint8_t* data = (uint8_t*) malloc(10);
+    
+    while (1) {
+        uart_write_bytes(uart_num, (const char*)sick_sensor_ask, sizeof(sick_sensor_ask));
+        // Read data from UART
+        int len = uart_read_bytes(uart_num, data, 10, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            // get distance value from received data
+            if (len >= 6 && data[0] == 0x02 && data[1] == 0x06) {
+                // valid data frame
+                int16_t raw_value = (data[2] << 8) | data[3];
+                distance_mm = raw_value / 100.0f; // convert to mm
+                xQueueSend(uart1_queue, &distance_mm, portMAX_DELAY);
+                uart_flush(uart_num);
+            }
         }
+        else {
+            ESP_LOGW(TAG, "No data received from sensor");
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    free(data);
+}
+
+static void uart2_task_handler(void *arg)
+{
+    /*
+    Transmission command: STX (02h) C (43h) B0h 01h ETX (03h) BCC (F2h)
+    Incoming data: STX (02h) ACK (06h) FCh 6Fh ETX (03h) BCC (95h)
+    *example with OD1-B035x15xxx/ measuring value = –9.13 mm
+    */
+    const uart_port_t uart_num = (uart_port_t)arg;
+    const static uint8_t sick_sensor_ask[] = {0x02, 0x43, 0xB0, 0x01, 0x03, 0xF2};
+    float distance_mm = 0.0f;
+    uint8_t* data = (uint8_t*) malloc(10);
+    
+    while (1) {
+        uart_write_bytes(uart_num, (const char*)sick_sensor_ask, sizeof(sick_sensor_ask));
+        // Read data from UART
+        int len = uart_read_bytes(uart_num, data, 10, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            // get distance value from received data
+            if (len >= 6 && data[0] == 0x02 && data[1] == 0x06) {
+                // valid data frame
+                int16_t raw_value = (data[2] << 8) | data[3];
+                distance_mm = raw_value / 100.0f; // convert to mm
+                xQueueSend(uart2_queue, &distance_mm, portMAX_DELAY);
+                uart_flush(uart_num);
+            }
+        }
+        else {
+            ESP_LOGW(TAG, "No data received from sensor");
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    free(data);
+}
+
+static void log_handler(void *arg)
+{
+    pcnt_unit_handle_t pcnt_unit = (pcnt_unit_handle_t)arg;
+    int pcnt_value = 0;
+    float dist1 = 0.0f, dist2 = 0.0f;
+    while (1) {
+        xQueueReceive(pcnt_val_queue, &pcnt_value, portMAX_DELAY);
+        xQueueReceive(uart1_queue, &dist1, portMAX_DELAY);
+        xQueueReceive(uart2_queue, &dist2, portMAX_DELAY);
+        ESP_LOGI(TAG, "Pulse Count: %d, Distance Sensor1: %.2f mm, Distance Sensor2: %.2f mm", pcnt_value, dist1, dist2);
     }
 }
