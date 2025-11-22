@@ -25,7 +25,7 @@ esp_err_t sick_od_mini_init( sick_od_mini_t *sensor,
     sensor->task_name = task_name;
     sensor->uart_port = uart_port;
     sensor->parse = sick_od_mini_parse;
-    sensor->stack = 2048;
+    sensor->stack = 1024;
     sensor->priority = 5;
     
     sensor->mutex = xSemaphoreCreateMutex();
@@ -83,7 +83,7 @@ static void sick_od_mini_task(void *arg)
             // Parse received data
             self->parse(self, buf, uart_data_len);
             state = SICK_OD_MINI_STATE_IDLE;
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(20));
             break;
         default:
             break;
