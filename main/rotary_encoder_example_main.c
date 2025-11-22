@@ -5,6 +5,7 @@
  */
 
 #include "sdkconfig.h"
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -30,7 +31,7 @@ static float distance_x = 0.0f;
 #define ENCODER_PPR  600  // pulses per revolution
 #define GEAR_RATIO   1    // gear ratio
 #define WHEEL_DIA_MM  200   // wheel diameter in mm
-#define WHEEL_CIRCUM_MM  (WHEEL_DIA_MM * 3.1416)
+#define WHEEL_CIRCUM_MM  (WHEEL_DIA_MM * M_PI)
 
 #define EXAMPLE_EC11_GPIO_A 16
 #define EXAMPLE_EC11_GPIO_B 17
